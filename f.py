@@ -1,449 +1,319 @@
-import time
 import logging
 import re
-import os
+import time
+import requests
+from bs4 import BeautifulSoup
+from telegram import Bot
+import asyncio
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
-from webdriver_manager.chrome import ChromeDriverManager
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-import random
-from dotenv import load_dotenv
+from selenium.common.exceptions import TimeoutException
 
-# Load environment variables
-load_dotenv()
-
-# Configure logging
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Telegram Bot Token
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-if not TELEGRAM_TOKEN:
-    TELEGRAM_TOKEN = input("Введите токен Telegram бота:7809190658:AAEi_uG41kvEanBFohFJpDE43eMOEpUcBcI ")
+# Конфигурация Telegram
+TELEGRAM_TOKEN = '7809190658:AAEi_uG41kvEanBFohFJpDE43eMOEpUcBcI'
+CHAT_ID = '@salesbuyers'
 
-CHAT_ID = os.getenv('CHAT_ID')
-if not CHAT_ID:
-    CHAT_ID = input("Введите ID чата Telegram:@salesbuyers ")
-
-# Delivery address for Perekrestok
-DEFAULT_ADDRESS = "ул. Земляной Вал, 29, Москва"
+# Параметры поиска
+MIN_DISCOUNT_PERCENT = 50  # Минимальный процент скидки
+MAX_PRICE = 50  # Максимальная цена в рублях
+DELIVERY_ADDRESS = 'Москва, ул. Примерная, д. 1'  # Ваш адрес доставки
 
 class FoodDeliveryParser:
-    def __init__(self, token=None):
-        self.setup_driver()
-        if token:
-            self.bot = Bot(token=token)
-        else:
-            self.bot = None
+    def __init__(self):
+        self.bot = Bot(token=TELEGRAM_TOKEN)
+        # Настройка Chrome для работы в фоновом режиме
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
         
-    def setup_driver(self):
-        """Setup Chrome driver with anti-detection measures"""
-        options = Options()
+        # Инициализация WebDriver
+        self.driver = webdriver.Chrome(options=chrome_options)
         
-        # Anti-detection measures
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--window-size=1920,1080")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option('useAutomationExtension', False)
+    def close(self):
+        """Закрыть WebDriver после завершения работы"""
+        if self.driver:
+            self.driver.quit()
+            
+    def extract_price(self, price_text):
+        """Извлечь числовую цену из текста"""
+        if not price_text:
+            return 0.0
         
-        # Performance options
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
+        # Удалить все нецифровые символы, кроме десятичной точки
+        price_match = re.search(r'(\d+[.,]?\d*)', price_text.replace(' ', ''))
+        if price_match:
+            return float(price_match.group(1).replace(',', '.'))
+        return 0.0
         
-        # Uncomment to run in headless mode when deploying
-        # options.add_argument("--headless")
+    def extract_discount(self, discount_text):
+        """Извлечь процент скидки из текста"""
+        if not discount_text:
+            return 0
+            
+        discount_match = re.search(r'-(\d+)%', discount_text)
+        if discount_match:
+            return int(discount_match.group(1))
+        return 0
         
-        # Add a random user agent
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36"
-        ]
-        options.add_argument(f"user-agent={random.choice(user_agents)}")
+    async def send_telegram_message(self, message):
+        """Отправить сообщение в Telegram"""
+        await self.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
         
-        # Create a new Chrome driver instance
-        self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    def parse_perekrestok_category(self, url):
+        """Парсинг категории Перекрестка с использованием Selenium"""
+        logger.info(f"Начинаем парсинг URL: {url}")
         
-        # Execute CDP commands to prevent detection
-        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                })
-            """
-        })
+        self.driver.get(url)
+        time.sleep(3)  # Даем время для загрузки страницы
         
-    def set_delivery_address(self, address=DEFAULT_ADDRESS):
-        """Set the delivery address on Perekrestok site"""
+        # Ждем загрузки карточек товаров
         try:
-            logger.info("Setting delivery address...")
-            
-            # Wait for address input field to be available
-            address_input = WebDriverWait(self.driver, 20).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "input[placeholder*='улица']"))
+            # На основе скриншота, карточки товаров могут иметь другой класс
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "article[data-testid='Product']"))
             )
-            
-            # Clear and set address
-            address_input.clear()
-            address_input.send_keys(address)
-            
-            # Wait for suggestions to appear and click the first one
-            suggestion = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, ".ymaps-2-1-79-search-suggest-item"))
-            )
-            suggestion.click()
-            
-            # Click OK button to confirm address
-            ok_button = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'OK') or contains(text(), 'Ок')]"))
-            )
-            ok_button.click()
-            
-            # Wait for page to update with new address
-            time.sleep(5)
-            logger.info("Address set successfully")
-            return True
-            
-        except (TimeoutException, NoSuchElementException, ElementClickInterceptedException) as e:
-            logger.error(f"Error setting address: {str(e)}")
-            # Take screenshot for debugging
-            self.driver.save_screenshot("address_error.png")
-            return False
-    
-    def parse_perekrestok(self, url="https://www.perekrestok.ru/catalog/moloko-syr-yaytsa/moloko"):
-        """Parse Perekrestok website for discounted products"""
-        try:
-            logger.info(f"Starting to parse URL: {url}")
-            
-            # Open the URL
-            self.driver.get(url)
-            time.sleep(5)  # Initial waiting time for page to load
-            
-            # Check if address selection is needed and set it
-            if "Укажите адрес доставки" in self.driver.page_source:
-                if not self.set_delivery_address():
-                    logger.error("Failed to set delivery address")
-                    return []
-            
-            # Wait for product cards to load
-            try:
-                WebDriverWait(self.driver, 15).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='product-card']"))
-                )
-            except TimeoutException:
-                # Try alternative selector if data-testid is not found
-                WebDriverWait(self.driver, 15).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, ".product-card"))
-                )
-            
-            # Scroll down to load all products
-            self._scroll_page()
-            
-            # Find all product cards (try multiple selectors)
-            product_cards = []
-            for selector in ["[data-testid='product-card']", ".product-card", ".xf-product"]:
-                try:
-                    cards = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                    if cards:
-                        product_cards = cards
-                        logger.info(f"Found {len(product_cards)} product cards using selector: {selector}")
-                        break
-                except Exception:
-                    continue
-            
-            if not product_cards:
-                logger.error("No product cards found")
-                self.driver.save_screenshot("no_products.png")
-                return []
-            
-            results = []
-            for card in product_cards:
-                try:
-                    # Extract product information
-                    product_info = self._extract_product_info(card)
-                    
-                    # Filter products by criteria (price < 50₽ or discount ≥ 50%)
-                    if (product_info['current_price'] < 50 or 
-                        (product_info['discount_percent'] and product_info['discount_percent'] >= 50)):
-                        results.append(product_info)
-                        logger.info(f"Found matching product: {product_info['name']} - {product_info['current_price']}₽")
-                        
-                except Exception as e:
-                    logger.error(f"Error processing product card: {str(e)}")
-                    continue
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error in parse_perekrestok: {str(e)}")
-            # Take screenshot for debugging
-            self.driver.save_screenshot("parse_error.png")
+        except TimeoutException:
+            logger.error("Истекло время ожидания загрузки страницы")
             return []
-    
-    def _extract_product_info(self, card):
-        """Extract product information from a card element"""
-        try:
-            # Try multiple selectors for each element to improve robustness
             
-            # Get product name
-            name = None
-            for selector in ["[data-testid='title']", ".xf-product-title", ".product-card__title"]:
-                try:
-                    name_elem = card.find_element(By.CSS_SELECTOR, selector)
-                    name = name_elem.text.strip()
-                    if name:
-                        break
-                except Exception:
-                    continue
-            
-            if not name:
-                # If all selectors failed, try to get the text content of the card
-                name = card.text.split('\n')[0].strip()
-            
-            # Get current price
-            current_price = None
-            for selector in ["[data-testid='price-current']", ".xf-product-price", ".product-card__price-current"]:
-                try:
-                    price_elem = card.find_element(By.CSS_SELECTOR, selector)
-                    current_price_text = price_elem.text.strip()
-                    # Extract digits and decimal point from price text
-                    current_price = float(re.sub(r'[^\d.,]', '', current_price_text).replace(',', '.'))
-                    break
-                except Exception:
-                    continue
-            
-            if current_price is None:
-                # Try to extract price from the text content using regex
-                card_text = card.text
-                price_match = re.search(r'(\d+[.,]?\d*)\s*[₽Р]', card_text)
-                if price_match:
-                    current_price = float(price_match.group(1).replace(',', '.'))
-                else:
-                    current_price = 0.0
-            
-            # Try to get original price (if discounted)
-            original_price = None
-            discount_percent = None
-            for selector in ["[data-testid='price-old']", ".xf-product-old-price", ".product-card__price-old"]:
-                try:
-                    original_price_elem = card.find_element(By.CSS_SELECTOR, selector)
-                    original_price_text = original_price_elem.text.strip()
-                    original_price = float(re.sub(r'[^\d.,]', '', original_price_text).replace(',', '.'))
-                    break
-                except Exception:
-                    continue
-            
-            # Look for discount percentage directly
-            if original_price is None:
-                for selector in [".discount-label", ".product-card__discount"]:
-                    try:
-                        discount_elem = card.find_element(By.CSS_SELECTOR, selector)
-                        discount_text = discount_elem.text.strip()
-                        discount_match = re.search(r'-(\d+)[%％]', discount_text)
-                        if discount_match:
-                            discount_percent = int(discount_match.group(1))
-                            if current_price > 0 and discount_percent > 0:
-                                # Calculate original price from discount
-                                original_price = current_price / (1 - discount_percent/100)
-                            break
-                    except Exception:
-                        continue
-            elif original_price > 0 and current_price > 0:
-                # Calculate discount percentage
-                discount_percent = round(((original_price - current_price) / original_price) * 100)
-            
-            # Get product URL
-            url = None
-            try:
-                url = card.find_element(By.CSS_SELECTOR, "a").get_attribute("href")
-            except Exception:
-                # If we can't find a direct link, try to construct one from the product name
-                product_id_match = re.search(r'data-product-id="(\d+)"', card.get_attribute('outerHTML'))
-                if product_id_match:
-                    product_id = product_id_match.group(1)
-                    url = f"https://www.perekrestok.ru/cat/{product_id}/p/"
-                else:
-                    url = "https://www.perekrestok.ru"
-            
-            return {
-                'name': name,
-                'current_price': current_price,
-                'original_price': original_price,
-                'discount_percent': discount_percent,
-                'url': url
-            }
-        except Exception as e:
-            logger.error(f"Error extracting product info: {str(e)}")
-            raise
-    
-    def _scroll_page(self):
-        """Scroll the page to load all products"""
+        # Прокрутка вниз для загрузки большего количества товаров
         last_height = self.driver.execute_script("return document.body.scrollHeight")
-        scroll_attempts = 0
-        max_attempts = 5
-        
-        while scroll_attempts < max_attempts:
-            # Scroll down
-            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        for _ in range(5):  # Прокручиваем несколько раз, чтобы загрузить больше товаров
+            self.driver.execute_script("window.scrollBy(0, 1000);")
+            time.sleep(2)  # Ждем загрузки контента
             
-            # Wait for new content to load
-            time.sleep(2)
-            
-            # Calculate new scroll height
             new_height = self.driver.execute_script("return document.body.scrollHeight")
-            
-            # Check if the page height has remained the same
             if new_height == last_height:
-                scroll_attempts += 1
-            else:
-                scroll_attempts = 0
-                
+                break
             last_height = new_height
             
-            # Break if we've made multiple attempts with no height change
-            if scroll_attempts >= max_attempts:
-                break
-    
-    async def send_to_telegram(self, products, chat_id=CHAT_ID):
-        """Send product information to Telegram"""
-        if not self.bot:
-            logger.warning("Telegram bot not initialized")
-            return
-            
-        if not products:
-            await self.bot.send_message(chat_id=chat_id, text="Товары со скидкой не найдены.")
-            return
-            
-        for product in products:
-            discount_info = ""
-            if product['discount_percent']:
-                discount_info = f"Скидка: {product['discount_percent']}% (Старая цена: {product['original_price']}₽)"
-                
-            message = (
-                f"🔥 *{product['name']}*\n"
-                f"💰 Цена: *{product['current_price']}₽*\n"
-                f"{discount_info}\n"
-                f"🏪 Магазин: Перекресток\n"
-                f"📍 Адрес доставки: {DEFAULT_ADDRESS}\n"
-                f"[Посмотреть товар]({product['url']})"
-            )
-            
-            await self.bot.send_message(
-                chat_id=chat_id,
-                text=message,
-                parse_mode="Markdown",
-                disable_web_page_preview=False
-            )
-            
-            # Avoid Telegram rate limits
-            time.sleep(1)
-    
-    def run_parser(self, categories=None):
-        """Run the parser for multiple categories"""
-        if categories is None:
-            categories = [
-                "https://www.perekrestok.ru/catalog/moloko-syr-yaytsa",
-                "https://www.perekrestok.ru/catalog/ovoshchi-i-frukty",
-                "https://www.perekrestok.ru/catalog/gotovaya-eda"
-            ]
-            
-        all_products = []
-        for category_url in categories:
+        # Получаем исходный код страницы после выполнения JavaScript
+        page_source = self.driver.page_source
+        soup = BeautifulSoup(page_source, 'html.parser')
+        
+        # Ищем все карточки товаров
+        # Используем селектор, который подходит для товаров на странице
+        product_cards = soup.select("article[data-testid='Product']")
+        logger.info(f"Найдено {len(product_cards)} карточек товаров")
+        
+        matching_products = []
+        
+        for card in product_cards:
             try:
-                logger.info(f"Processing category: {category_url}")
-                products = self.parse_perekrestok(category_url)
-                all_products.extend(products)
-            except Exception as e:
-                logger.error(f"Error processing category {category_url}: {str(e)}")
-        
-        # Close the browser
-        self.driver.quit()
-        
-        return all_products
-
-# Telegram bot command handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
-    await update.message.reply_text('Привет! Я бот для поиска выгодных продуктов. Используй /find для поиска скидок.')
-
-async def find_deals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Find deals command handler"""
-    await update.message.reply_text('Начинаю поиск скидок в Перекрестке...')
-    
-    parser = FoodDeliveryParser(token=TELEGRAM_TOKEN)
-    products = parser.run_parser()
-    
-    if not products:
-        await update.message.reply_text('К сожалению, не удалось найти товары со скидкой.')
-    else:
-        await update.message.reply_text(f'Найдено {len(products)} товаров. Отправляю информацию...')
-        
-        for product in products:
-            discount_info = ""
-            if product['discount_percent']:
-                discount_info = f"Скидка: {product['discount_percent']}% (Старая цена: {product['original_price']}₽)"
+                # Извлекаем название товара
+                title_element = card.select_one("h3")
+                if not title_element:
+                    continue
+                    
+                product_title = title_element.text.strip()
                 
-            message = (
-                f"🔥 *{product['name']}*\n"
-                f"💰 Цена: *{product['current_price']}₽*\n"
-                f"{discount_info}\n"
-                f"🏪 Магазин: Перекресток\n"
-                f"📍 Адрес доставки: {DEFAULT_ADDRESS}\n"
-                f"[Посмотреть товар]({product['url']})"
-            )
+                # Извлекаем текущую цену
+                # Ищем цены в разных форматах
+                price_elements = card.select("span")
+                current_price = 0
+                original_price = 0
+                
+                for element in price_elements:
+                    price_text = element.text.strip()
+                    if '₽' in price_text:
+                        # Проверяем, является ли это текущей или старой ценой
+                        if 'старая' in element.get('class', []) or 'old' in element.get('class', []):
+                            original_price = self.extract_price(price_text)
+                        else:
+                            current_price = self.extract_price(price_text)
+                
+                # Если мы все еще не нашли цену, ищем ее по формату
+                if current_price == 0:
+                    for element in price_elements:
+                        price_text = element.text.strip()
+                        if '₽' in price_text:
+                            # Если мы еще не определили текущую цену, это она
+                            current_price = self.extract_price(price_text)
+                            break
+                
+                # Если мы все еще не нашли цену, проверим весь текст карточки
+                if current_price == 0:
+                    all_text = card.get_text().strip()
+                    price_match = re.search(r'(\d+)\s*₽', all_text)
+                    if price_match:
+                        current_price = float(price_match.group(1))
+                
+                # Извлекаем процент скидки
+                discount_element = card.select_one("div.discount")
+                discount_percent = 0
+                
+                if discount_element:
+                    discount_text = discount_element.text.strip()
+                    discount_percent = self.extract_discount(discount_text)
+                elif original_price > 0 and current_price > 0:
+                    # Вычисляем скидку, если она не указана явно
+                    discount_percent = int(((original_price - current_price) / original_price) * 100)
+                
+                # Определяем, есть ли скидка по тексту
+                if discount_percent == 0:
+                    discount_text = card.get_text()
+                    discount_match = re.search(r'-(\d+)%', discount_text)
+                    if discount_match:
+                        discount_percent = int(discount_match.group(1))
+                
+                # Получаем URL товара
+                product_link = card.find('a')
+                product_url = ""
+                if product_link and 'href' in product_link.attrs:
+                    product_url = "https://eda.yandex.ru" + product_link['href']
+                
+                # Проверяем, соответствует ли товар нашим критериям
+                if (current_price <= MAX_PRICE and current_price > 0) or (discount_percent >= MIN_DISCOUNT_PERCENT):
+                    product_info = {
+                        'title': product_title,
+                        'current_price': current_price,
+                        'original_price': original_price,
+                        'discount_percent': discount_percent,
+                        'url': product_url
+                    }
+                    matching_products.append(product_info)
+                    
+                    logger.info(f"Найден подходящий товар: {product_title} - {current_price}₽ (Скидка: {discount_percent}%)")
+                    
+            except Exception as e:
+                logger.error(f"Ошибка при обработке карточки товара: {e}")
+                
+        return matching_products
+    
+    def get_category_urls(self, base_url):
+        """Получить URLs всех категорий для Перекрестка"""
+        self.driver.get(base_url)
+        time.sleep(3)  # Ждем загрузку страницы
+        
+        # Сохраняем категории из боковой панели, которая видна на скриншоте
+        soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+        
+        # Ищем все элементы навигации по категориям в боковом меню
+        category_links = []
+        
+        # Пробуем найти категории в боковом меню
+        side_menu_categories = soup.select("a.UiKitSideMenu__link")
+        for category in side_menu_categories:
+            href = category.get('href')
+            if href and '/catalog/' in href:
+                full_url = f"https://eda.yandex.ru{href}"
+                category_links.append(full_url)
+                logger.info(f"Найдена категория в боковом меню: {category.text.strip()} ({full_url})")
+        
+        # Если не найдено категорий в боковом меню, ищем другие категории
+        if not category_links:
+            all_links = soup.find_all('a')
+            for link in all_links:
+                href = link.get('href')
+                if href and '/catalog/' in href and 'placeSlug=' in href:
+                    full_url = f"https://eda.yandex.ru{href}"
+                    if full_url not in category_links:
+                        category_links.append(full_url)
+                        logger.info(f"Найдена категория: {link.text.strip()} ({full_url})")
+        
+        # Если все еще не найдено категорий, используем ссылки из вашего сообщения
+        if not category_links:
+            logger.info("Категории не найдены, используем предоставленные ссылки")
+            category_links = [
+                "https://eda.yandex.ru/retail/perekrestok/catalog/44008?placeSlug=perekrestok_wjtsp",
+                "https://eda.yandex.ru/retail/perekrestok/catalog/241010?placeSlug=perekrestok_wjtsp",
+                "https://eda.yandex.ru/retail/perekrestok/catalog/290456?placeSlug=perekrestok_wjtsp",
+                "https://eda.yandex.ru/retail/perekrestok/catalog/21857?placeSlug=perekrestok_wjtsp",
+                "https://eda.yandex.ru/retail/perekrestok/catalog/21849?placeSlug=perekrestok_wjtsp",
+                "https://eda.yandex.ru/retail/perekrestok/catalog/2873?placeSlug=perekrestok_wjtsp",
+                "https://eda.yandex.ru/retail/perekrestok/catalog/158336?placeSlug=perekrestok_wjtsp",
+                "https://eda.yandex.ru/retail/perekrestok/catalog/268686?placeSlug=perekrestok_wjtsp",
+                "https://eda.yandex.ru/retail/perekrestok/catalog/2910?placeSlug=perekrestok_wjtsp",
+                "https://eda.yandex.ru/retail/perekrestok/catalog/167?placeSlug=perekrestok_wjtsp",
+                "https://eda.yandex.ru/retail/perekrestok/catalog/220376?placeSlug=perekrestok_wjtsp",
+                "https://eda.yandex.ru/retail/perekrestok/catalog/222879?placeSlug=perekrestok_wjtsp",
+                "https://eda.yandex.ru/retail/perekrestok/catalog/220380?placeSlug=perekrestok_wjtsp"
+            ]
+        
+        logger.info(f"Всего найдено {len(category_links)} категорий для парсинга")
+        return category_links
+        
+    async def run(self):
+        """Основная функция для запуска парсера"""
+        try:
+            # Базовая URL для Перекрестка
+            base_url = "https://eda.yandex.ru/retail/perekrestok/catalog?placeSlug=perekrestok_wjtsp"
             
-            await update.message.reply_text(
-                text=message,
-                parse_mode="Markdown",
-                disable_web_page_preview=False
-            )
+            # Получаем URL категорий
+            category_urls = self.get_category_urls(base_url)
             
-            # Avoid Telegram rate limits
-            time.sleep(1)
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors caused by updates"""
-    logger.error(f'Update {update} caused error {context.error}')
+            if not category_urls:
+                logger.error("Не удалось найти категории для парсинга")
+                await self.send_telegram_message("Не удалось найти категории для парсинга. Проверьте структуру сайта.")
+                return
+            
+            all_matching_products = []
+            
+            # Парсим каждую категорию
+            for category_url in category_urls:
+                category_products = self.parse_perekrestok_category(category_url)
+                if category_products:
+                    all_matching_products.extend(category_products)
+            
+            if all_matching_products:
+                # Отправляем результаты в Telegram
+                message = f"Найдено {len(all_matching_products)} товаров в Перекрестке по вашим критериям:\n\n"
+                
+                for product in all_matching_products[:10]:  # Ограничиваем до 10 товаров на сообщение
+                    discount_info = f" (Скидка: {product['discount_percent']}%)" if product['discount_percent'] > 0 else ""
+                    message += f"• <b>{product['title']}</b>\n"
+                    message += f"  Цена: {product['current_price']}₽{discount_info}\n"
+                    if product['url']:
+                        message += f"  <a href='{product['url']}'>Перейти к товару</a>\n\n"
+                    else:
+                        message += "\n"
+                
+                message += f"\nАдрес доставки: {DELIVERY_ADDRESS}"
+                
+                await self.send_telegram_message(message)
+                
+                # Если найдено больше 10 товаров, отправляем дополнительные сообщения
+                if len(all_matching_products) > 10:
+                    chunks = [all_matching_products[i:i+10] for i in range(10, len(all_matching_products), 10)]
+                    
+                    for chunk in chunks:
+                        message = "Дополнительные товары в Перекрестке:\n\n"
+                        
+                        for product in chunk:
+                            discount_info = f" (Скидка: {product['discount_percent']}%)" if product['discount_percent'] > 0 else ""
+                            message += f"• <b>{product['title']}</b>\n"
+                            message += f"  Цена: {product['current_price']}₽{discount_info}\n"
+                            if product['url']:
+                                message += f"  <a href='{product['url']}'>Перейти к товару</a>\n\n"
+                            else:
+                                message += "\n"
+                        
+                        await self.send_telegram_message(message)
+            else:
+                await self.send_telegram_message("В Перекрестке не найдено товаров, соответствующих критериям.")
+                
+        except Exception as e:
+            logger.error(f"Ошибка в методе run: {e}")
+            await self.send_telegram_message(f"Произошла ошибка при парсинге: {e}")
+        finally:
+            self.close()
 
 async def main():
-    """Run the bot"""
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Add command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("find", find_deals))
-    
-    # Add error handler
-    application.add_error_handler(error_handler)
-    
-    # Start the bot
-    await application.run_polling()
+    parser = FoodDeliveryParser()
+    await parser.run()
 
 if __name__ == "__main__":
-    try:
-        # Тестовый режим без телеграма
-        print("Запуск в режиме тестирования без отправки в Telegram")
-        parser = FoodDeliveryParser()
-        products = parser.parse_perekrestok("https://www.perekrestok.ru/catalog/moloko-syr-yaytsa/moloko")
-        
-        print(f"Найдено {len(products)} товаров, соответствующих критериям")
-        for product in products:
-            print(f"{product['name']} - {product['current_price']}₽")
-        
-        # Раскомментируй следующие строки для запуска бота
-        # import asyncio
-        # asyncio.run(main())
-        
-    except Exception as e:
-        logger.error(f"Критическая ошибка: {str(e)}")
-        input("Нажмите Enter для выхода...")
+    asyncio.run(main())
